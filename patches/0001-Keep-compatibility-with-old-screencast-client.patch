@@ -1,0 +1,117 @@
+From 88d6d4fa1d554e15ff089dd2640e49471e658379 Mon Sep 17 00:00:00 2001
+From: Julien Isorce <jisorce@oblong.com>
+Date: Thu, 15 Feb 2018 12:26:48 +0000
+Subject: [PATCH] Keep compatibility with old screencast client
+
+The fixes video block artifacts that could be seen when using WIFI
+with the old client and the new provisioner.
+But this can also be reproduced when forcing some packet lose over
+wired network.
+More generally it happens when packets are restransmitted (rtx)
+by the 'old' client and received by the 'new' provisioner.
+
+The old chromium webrtc implementation only supports one rtx stream.
+And it is always associated with the red stream if red is negociated.
+
+The bug is that the sdp offer sent by the old client says that the
+rtx stream is associated with the vp8 stream whereas it should say
+that it is associated with the red stream. Because this is what it
+really sends.
+
+Since the old chromium webrtc implementation uses static payload
+types and because the old client only have one session with one
+vp8 stream it is clearly possible to identify when we can apply
+the compatibility. Also the new chromium webrtc implementation
+uses different default values for vp8, rtx and red so it won't
+cause any regression with the new client.
+
+There is a potentially a way to fix on the fly the sdp received in
+the new provisioner but so far it did not work. Indeed my initial trial
+showed me that it would also require a modification in the webrtcbuilds.
+It seems the bug in the old webrtc stack was really deep. So in the end
+any solution requires to modify webrtcbuilds.
+
+https://webrtc.googlesource.com/src/+/10880011d9f116a9aff87436de231151e355ac7d
+https://bugs.oblong.com/show_bug.cgi?id=19207
+https://mezzanine.tpondemand.com/entity/16085-as-a-mezzanine-developer-i-want
+---
+ .../rtp_rtcp/include/rtp_payload_registry.h        |  1 +
+ .../rtp_rtcp/source/rtp_payload_registry.cc        | 36 ++++++++++++++++++++--
+ 2 files changed, 35 insertions(+), 2 deletions(-)
+
+diff --git a/webrtc/modules/rtp_rtcp/include/rtp_payload_registry.h b/webrtc/modules/rtp_rtcp/include/rtp_payload_registry.h
+index e54e8c2..bac88f1 100644
+--- a/webrtc/modules/rtp_rtcp/include/rtp_payload_registry.h
++++ b/webrtc/modules/rtp_rtcp/include/rtp_payload_registry.h
+@@ -117,6 +117,7 @@ class RTPPayloadRegistry {
+ 
+   rtc::CriticalSection crit_sect_;
+   std::map<int, RtpUtility::Payload> payload_type_map_;
++  int8_t red_payload_type_;
+   int8_t incoming_payload_type_;
+   int8_t last_received_payload_type_;
+   int8_t last_received_media_payload_type_;
+diff --git a/webrtc/modules/rtp_rtcp/source/rtp_payload_registry.cc b/webrtc/modules/rtp_rtcp/source/rtp_payload_registry.cc
+index 234fd7f..67f96ec 100644
+--- a/webrtc/modules/rtp_rtcp/source/rtp_payload_registry.cc
++++ b/webrtc/modules/rtp_rtcp/source/rtp_payload_registry.cc
+@@ -112,7 +112,8 @@ bool IsPayloadTypeValid(int8_t payload_type) {
+ }  // namespace
+ 
+ RTPPayloadRegistry::RTPPayloadRegistry()
+-    : incoming_payload_type_(-1),
++    : red_payload_type_(-1),
++      incoming_payload_type_(-1),
+       last_received_payload_type_(-1),
+       last_received_media_payload_type_(-1),
+       rtx_(false),
+@@ -208,6 +209,9 @@ int32_t RTPPayloadRegistry::RegisterReceivePayload(
+ 
+   payload_type_map_[video_codec.plType] = CreatePayloadType(video_codec);
+ 
++  if (RtpUtility::StringCompare(video_codec.plName, "red", 3))
++    red_payload_type_ = video_codec.plType;
++
+   // Successful set of payload type, clear the value of last received payload
+   // type since it might mean something else.
+   last_received_payload_type_ = -1;
+@@ -322,7 +326,35 @@ bool RTPPayloadRegistry::RestoreOriginalPacket(uint8_t* restored_packet,
+     }
+     return false;
+   }
+-  restored_packet[1] = static_cast<uint8_t>(apt_mapping->second);
++
++  // OSC stands for Old Screencast Client. Below are constants
++  // that are used in the Nov 4 2014 chromium webrtc release,
++  // commit b8425bc4f398cb1e744c5f60677f1b5cae4ade81.
++  // 100 and 96 are defined here https://webrtc.googlesource.com/src/+/b8425bc4f398cb1e744c5f60677f1b5cae4ade81/talk/media/webrtc/webrtcvideoengine2.cc#144
++  // 116 is defined here https://webrtc.googlesource.com/src/+/b8425bc4f398cb1e744c5f60677f1b5cae4ade81/talk/media/webrtc/webrtcvideoengine2.cc#148
++  const int kVp8PayloadTypeOSC = 100;
++  const int kRtxPayloadTypeOSC = 96;
++  const int kRedPayloadTypeOSC = 116;
++
++  // Keep compatibility with old version of chromium-webrtc by
++  // restoring bad rtx as red packets as noted in paragraph 2 here:
++  // https://crrev.com/10880011d9f116a9aff87436de231151e355ac7d
++  if (header.payloadType == kRtxPayloadTypeOSC &&
++      apt_mapping->second == kVp8PayloadTypeOSC &&
++      red_payload_type_ == kRedPayloadTypeOSC) {
++    // The bug is that the sdp announces that the rtx stream is associated with
++    // the vp8 stream whereas it is in fact associated with the red stream.
++    // Here it means to replace a=fmtp:96 apt=100 by a=fmtp:96 apt=116.
++    LOG(LS_INFO) << "Buggy rtx packet " << static_cast<int>(header.payloadType)
++                 << " -> " << static_cast<int>(apt_mapping->second)
++                 << " -> " << static_cast<int>(red_payload_type_);
++    restored_packet[1] = static_cast<uint8_t>(red_payload_type_);
++  } else {
++    LOG(LS_INFO) << "rtx packet " << static_cast<int>(header.payloadType)
++                 << " -> " << static_cast<int>(apt_mapping->second);
++    restored_packet[1] = static_cast<uint8_t>(apt_mapping->second);
++  }
++
+   if (header.markerBit) {
+     restored_packet[1] |= kRtpMarkerBitMask;  // Marker bit is set.
+   }
+-- 
+2.7.4
+

@@ -164,6 +164,13 @@ function patch() {
   [ "$rtti_enabled" = 1 ] && sed -i.bak \
     's|"//build/config/compiler:no_rtti",|"//build/config/compiler:rtti",|' \
     build/config/BUILDCONFIG.gn
+  # Apply git patches.
+  local patches_dir="../../patches"
+  for p in $patches_dir/*; do
+    if [ -r "$p" ]; then
+      git am -3 $p
+    fi
+  done
   popd >/dev/null
 }
 
