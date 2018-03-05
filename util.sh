@@ -384,6 +384,7 @@ Package: $package_name
 Architecture: $arch
 Maintainer: webrtcbuilds manintainers
 Depends: debconf (>= 0.5.00)
+Section: main
 Priority: optional
 Version: $package_version
 Description: webrtc static library
